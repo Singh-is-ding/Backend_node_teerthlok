@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: vr-video-server
+    env: node
+    buildCommand: npm install && pip install yt-dlp
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 10000

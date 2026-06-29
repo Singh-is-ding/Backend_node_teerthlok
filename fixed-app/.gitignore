@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+*.local
+server/downloads/*.mp4
+server/downloads/*.mkv
+server/downloads/*.webm
