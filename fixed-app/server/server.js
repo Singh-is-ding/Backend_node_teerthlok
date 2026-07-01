@@ -39,6 +39,18 @@ const COOKIES_ARGS_STR = cookiesAvailable ? `--cookies "${WRITABLE_COOKIES_PATH}
 app.use(cors());
 app.use(express.json());
 
+// Log any crash that would otherwise silently kill the process (and wipe in-memory jobs)
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL uncaughtException]", err.stack || err.message);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL unhandledRejection]", reason instanceof Error ? reason.stack : reason);
+});
+setInterval(() => {
+  const mem = process.memoryUsage();
+  console.log(`[memory] rss=${Math.round(mem.rss / 1024 / 1024)}MB heapUsed=${Math.round(mem.heapUsed / 1024 / 1024)}MB`);
+}, 15000);
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function safeName(str) {
