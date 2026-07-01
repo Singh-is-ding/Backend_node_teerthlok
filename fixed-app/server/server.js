@@ -66,7 +66,7 @@ async function getVideoInfo(url) {
   if (cookiesAvailable) {
     try {
       const { stdout } = await execAsync(
-        `yt-dlp --dump-json --no-playlist --js-runtimes node ${COOKIES_ARGS_STR} "${url}"`,
+        `yt-dlp --dump-json --no-playlist --js-runtimes node --remote-components ejs:github ${COOKIES_ARGS_STR} "${url}"`,
         { maxBuffer: 1024 * 1024 * 16 }
       );
       return JSON.parse(stdout);
@@ -233,7 +233,7 @@ async function downloadVideo(url, outputTemplate, jobId) {
   if (cookiesAvailable) {
     const current = jobs.get(jobId);
     if (current) jobs.set(jobId, { ...current, message: "Retrying with authenticated session..." });
-    await runYtDlpDownload(url, outputTemplate, ["--js-runtimes", "node", ...COOKIES_ARGS], onProgress);
+    await runYtDlpDownload(url, outputTemplate, ["--js-runtimes", "node", "--remote-components", "ejs:github", ...COOKIES_ARGS], onProgress);
     return;
   }
 
@@ -375,7 +375,7 @@ app.get("/debug-cookies", async (req, res) => {
   try {
     refreshWritableCookies(); // get a fresh writable copy in case the secret changed
     const { stdout, stderr } = await execAsync(
-      `yt-dlp --js-runtimes node ${COOKIES_ARGS_STR} --dump-json --no-playlist "https://www.youtube.com/watch?v=VDNIuBQBSmk"`,
+      `yt-dlp --js-runtimes node --remote-components ejs:github ${COOKIES_ARGS_STR} --dump-json --no-playlist "https://www.youtube.com/watch?v=VDNIuBQBSmk"`,
       { maxBuffer: 1024 * 1024 * 16 }
     );
     res.json({ success: true, cookiesAvailable, stdout: stdout.slice(0, 500), stderr });
