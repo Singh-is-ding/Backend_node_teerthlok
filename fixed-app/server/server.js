@@ -308,6 +308,18 @@ app.get("/info", async (req, res) => {
   }
 });
 
+app.get("/debug-cookies", async (req, res) => {
+  try {
+    const { stdout, stderr } = await execAsync(
+      `yt-dlp --cookies /etc/secrets/cookies.txt --dump-json --no-playlist "https://www.youtube.com/watch?v=VDNIuBQBSmk"`,
+      { maxBuffer: 1024 * 1024 * 16 }
+    );
+    res.json({ success: true, stdout: stdout.slice(0, 500), stderr });
+  } catch (e) {
+    res.json({ success: false, error: e.message, stderr: e.stderr, stdout: e.stdout });
+  }
+});
+
 app.get("/list", (_req, res) => {
   try {
     const files = fs.readdirSync(DOWNLOADS_DIR)
