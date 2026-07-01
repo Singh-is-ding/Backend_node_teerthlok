@@ -1,16 +1,14 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { fetchInfo, startDownload, pollJob, formatDuration } from "../api.js";
+import { fetchInfo, fetchStream, formatDuration } from "../api.js";
 
 export default function HomePage() {
   const [url, setUrl] = useState("");
   const [preview, setPreview] = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
-  const [jobId, setJobId] = useState(null);
-  const [job, setJob] = useState(null);
+  const [loadingStream, setLoadingStream] = useState(false);
   const [error, setError] = useState("");
   const previewTimer = useRef(null);
-  const pollTimer = useRef(null);
   const navigate = useNavigate();
 
   // Auto-preview
@@ -33,48 +31,25 @@ export default function HomePage() {
     return () => clearTimeout(previewTimer.current);
   }, [url]);
 
-  // Poll job
-  useEffect(() => {
-    if (!jobId) return;
-    pollTimer.current = setInterval(async () => {
-      try {
-        const j = await pollJob(jobId);
-        setJob(j);
-        if (j.status === "done" || j.status === "error") {
-          clearInterval(pollTimer.current);
-        }
-      } catch {}
-    }, 1000);
-    return () => clearInterval(pollTimer.current);
-  }, [jobId]);
-
-  const handleDownload = async () => {
+  const handleWatch = async () => {
     if (!url.trim()) return;
     setError("");
-    setJob(null);
+    setLoadingStream(true);
     try {
-      const id = await startDownload(url.trim());
-      setJobId(id);
-      setJob({ status: "pending", progress: 0, message: "Queued…" });
+      const stream = await fetchStream(url.trim());
+      navigate("/player", {
+        state: {
+          streamUrl: stream.streamUrl,
+          projection: stream.projection,
+          title: stream.title,
+        },
+      });
     } catch (e) {
       setError(e.message);
+    } finally {
+      setLoadingStream(false);
     }
   };
-
-  const handleWatch = () => {
-    if (!job?.filename) return;
-    navigate("/player", {
-      state: {
-        filename: job.filename,
-        projection: job.projection,
-        title: job.title,
-      },
-    });
-  };
-
-  const isDownloading = job && (job.status === "pending" || job.status === "running");
-  const isDone = job?.status === "done";
-  const isError = job?.status === "error";
 
   return (
     <div className="min-h-screen pt-20 pb-16 px-4 flex flex-col items-center">
@@ -90,7 +65,7 @@ export default function HomePage() {
           VR<span className="text-glow" style={{ color: "#00d4ff" }}>VAULT</span>
         </h1>
         <p className="text-muted text-lg max-w-md mx-auto fade-up fade-up-3" style={{ fontFamily: "'DM Sans'" }}>
-          Paste any video URL. We download it. You watch it in immersive 360° VR — right in your browser.
+          Paste any video URL. We fetch a direct stream. You watch it in immersive 360° VR — right in your browser.
         </p>
       </div>
 
@@ -118,24 +93,24 @@ export default function HomePage() {
               <input
                 value={url}
                 onChange={e => setUrl(e.target.value)}
-                onKeyDown={e => e.key === "Enter" && handleDownload()}
+                onKeyDown={e => e.key === "Enter" && handleWatch()}
                 placeholder="https://youtube.com/watch?v=..."
                 className="flex-1 bg-transparent py-3.5 text-sm outline-none"
                 style={{ fontFamily: "'JetBrains Mono'", color: "#e8e8f8" }}
               />
             </div>
             <button
-              onClick={handleDownload}
-              disabled={!url.trim() || isDownloading}
+              onClick={handleWatch}
+              disabled={!url.trim() || loadingStream}
               className="px-6 rounded-xl font-semibold text-sm transition-all duration-200 whitespace-nowrap"
               style={{
-                background: url.trim() && !isDownloading
+                background: url.trim() && !loadingStream
                   ? "linear-gradient(135deg, #00d4ff, #0099cc)"
                   : "#1e1e2e",
-                color: url.trim() && !isDownloading ? "#000" : "#4a4a6a",
-                boxShadow: url.trim() && !isDownloading ? "0 0 20px rgba(0,212,255,0.3)" : "none",
+                color: url.trim() && !loadingStream ? "#000" : "#4a4a6a",
+                boxShadow: url.trim() && !loadingStream ? "0 0 20px rgba(0,212,255,0.3)" : "none",
               }}>
-              {isDownloading ? "Downloading…" : "Download"}
+              {loadingStream ? "Loading…" : "▶ Watch in VR"}
             </button>
           </div>
 
@@ -166,62 +141,6 @@ export default function HomePage() {
             </div>
           )}
 
-          {/* Job progress */}
-          {job && (
-            <div className="mt-4 rounded-xl p-4"
-              style={{
-                background: "#13131e",
-                border: `1px solid ${isDone ? "rgba(0,255,136,0.3)" : isError ? "rgba(255,60,60,0.3)" : "rgba(0,212,255,0.2)"}`,
-                animation: "fadeUp 0.3s ease",
-              }}>
-              <div className="flex items-center justify-between mb-3">
-                <div className="flex items-center gap-2">
-                  {isDownloading && <Spinner size={14} color="#00d4ff" />}
-                  {isDone && <div className="w-3.5 h-3.5 rounded-full bg-green-400" style={{ boxShadow: "0 0 8px #22c55e" }} />}
-                  {isError && <div className="w-3.5 h-3.5 rounded-full bg-red-500" />}
-                  <span className="text-sm font-mono"
-                    style={{ color: isDone ? "#22c55e" : isError ? "#ef4444" : "#00d4ff" }}>
-                    {job.message}
-                  </span>
-                </div>
-                {isDownloading && (
-                  <span className="text-xs font-mono" style={{ color: "#4a4a6a" }}>
-                    {job.progress}%
-                  </span>
-                )}
-              </div>
-
-              {(isDownloading || isDone) && (
-                <div className="h-1 rounded-full overflow-hidden" style={{ background: "#1e1e2e" }}>
-                  <div
-                    className={isDone ? "" : "progress-bar"}
-                    style={{
-                      height: "100%",
-                      width: `${job.progress}%`,
-                      borderRadius: "9999px",
-                      background: isDone ? "#22c55e" : undefined,
-                      transition: "width 0.4s ease",
-                      boxShadow: isDone ? "0 0 8px #22c55e" : undefined,
-                    }}
-                  />
-                </div>
-              )}
-
-              {isDone && (
-                <button
-                  onClick={handleWatch}
-                  className="mt-4 w-full py-3 rounded-xl font-semibold text-sm transition-all duration-200"
-                  style={{
-                    background: "linear-gradient(135deg, #ff3cac, #cc0088)",
-                    color: "#fff",
-                    boxShadow: "0 0 24px rgba(255,60,172,0.4)",
-                  }}>
-                  ▶ Watch in VR
-                </button>
-              )}
-            </div>
-          )}
-
           {error && (
             <div className="mt-3 px-4 py-3 rounded-xl text-sm font-mono"
               style={{ background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.25)", color: "#f87171" }}>
@@ -234,7 +153,7 @@ export default function HomePage() {
         <div className="mt-12 grid grid-cols-3 gap-4">
           {[
             { icon: "🔗", title: "Paste URL", desc: "Any YouTube, Vimeo, or supported site" },
-            { icon: "⬇", title: "Download", desc: "Backend fetches the best quality stream" },
+            { icon: "📡", title: "Fetch Stream", desc: "Backend resolves a direct playable stream" },
             { icon: "🥽", title: "Watch in VR", desc: "Immersive 360° player with WebXR support" },
           ].map((item, i) => (
             <div key={i} className="rounded-xl p-4 text-center"
