@@ -2,7 +2,7 @@ services:
   - type: web
     name: vr-video-server
     env: node
-    buildCommand: apt-get update && apt-get install -y ffmpeg && npm install && pip install -U yt-dlp
+    buildCommand: npm install && pip install -U yt-dlp --break-system-packages
     startCommand: npm start
     envVars:
       - key: PORT
