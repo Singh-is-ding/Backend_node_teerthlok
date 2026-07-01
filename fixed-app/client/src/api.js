@@ -6,43 +6,13 @@ export async function fetchInfo(url) {
   return res.json();
 }
 
-export async function startDownload(url) {
-  const res = await fetch(`${BASE}/download`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url }),
-  });
+// Replaces the old startDownload + pollJob flow — a single call that returns
+// a direct, playable stream URL (routed through our own /proxy for CORS).
+// No server-side downloading or storage happens.
+export async function fetchStream(url) {
+  const res = await fetch(`${BASE}/stream?url=${encodeURIComponent(url)}`);
   if (!res.ok) { const e = await res.json(); throw new Error(e.error); }
-  const data = await res.json();
-  return data.jobId;
-}
-
-export async function pollJob(jobId) {
-  const res = await fetch(`${BASE}/jobs/${jobId}`);
-  if (!res.ok) throw new Error("Job not found");
   return res.json();
-}
-
-export async function listFiles() {
-  const res = await fetch(`${BASE}/list`);
-  if (!res.ok) throw new Error("Failed to list files");
-  return res.json();
-}
-
-export async function deleteFile(name) {
-  await fetch(`${BASE}/video/${encodeURIComponent(name)}`, { method: "DELETE" });
-}
-
-export function videoUrl(filename) {
-  return `${BASE}/video/${encodeURIComponent(filename)}`;
-}
-
-export function formatBytes(bytes) {
-  if (!bytes) return "";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
 }
 
 export function formatDuration(secs) {
