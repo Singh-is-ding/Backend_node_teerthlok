@@ -1,23 +1,43 @@
 import express from "express";
 import cors from "cors";
-import { exec, spawn } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
+import { Readable } from "stream";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 4000;
-const DOWNLOADS_DIR = path.join(__dirname, "downloads");
 
-if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+// Trust Render's reverse proxy so req.protocol reports "https" correctly
+app.set("trust proxy", true);
 
-// Render's Secret Files are mounted read-only, but yt-dlp needs to re-save
-// the cookie jar after use. So copy the secret file into a writable path once at startup.
+app.use(cors());
+app.use(express.json());
+
+// ── crash / memory visibility (kept lightweight, no more OOM expected) ─────
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL uncaughtException]", err.stack || err.message);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL unhandledRejection]", reason instanceof Error ? reason.stack : reason);
+});
+setInterval(() => {
+  const mem = process.memoryUsage();
+  console.log(`[memory] rss=${Math.round(mem.rss / 1024 / 1024)}MB heapUsed=${Math.round(mem.heapUsed / 1024 / 1024)}MB`);
+}, 30000);
+
+// ── cookies (optional fallback only — most requests won't need it) ─────────
+// Render's Secret Files are mounted read-only, but yt-dlp needs a writable
+// path to (re)save the cookie jar, so we copy it once at startup.
+const RUNTIME_DIR = path.join(__dirname, ".runtime");
+if (!fs.existsSync(RUNTIME_DIR)) fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+
 const SECRET_COOKIES_PATH = "/etc/secrets/cookies.txt";
-const WRITABLE_COOKIES_PATH = path.join(DOWNLOADS_DIR, "cookies_runtime.txt");
+const WRITABLE_COOKIES_PATH = path.join(RUNTIME_DIR, "cookies_runtime.txt");
 
 function refreshWritableCookies() {
   try {
@@ -31,65 +51,11 @@ function refreshWritableCookies() {
   return false;
 }
 const cookiesAvailable = refreshWritableCookies();
-console.log(cookiesAvailable ? "[cookies] loaded from secret file" : "[cookies] no secret cookies file found, proceeding without cookies");
+console.log(cookiesAvailable ? "[cookies] loaded from secret file" : "[cookies] no secret cookies file found — Android client only");
 
 const COOKIES_ARGS = cookiesAvailable ? ["--cookies", WRITABLE_COOKIES_PATH] : [];
-const COOKIES_ARGS_STR = cookiesAvailable ? `--cookies "${WRITABLE_COOKIES_PATH}"` : "";
 
-app.use(cors());
-app.use(express.json());
-
-// Log any crash that would otherwise silently kill the process (and wipe in-memory jobs)
-process.on("uncaughtException", (err) => {
-  console.error("[FATAL uncaughtException]", err.stack || err.message);
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("[FATAL unhandledRejection]", reason instanceof Error ? reason.stack : reason);
-});
-setInterval(() => {
-  const mem = process.memoryUsage();
-  console.log(`[memory] rss=${Math.round(mem.rss / 1024 / 1024)}MB heapUsed=${Math.round(mem.heapUsed / 1024 / 1024)}MB`);
-}, 15000);
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-function safeName(str) {
-  return (str ?? "video")
-    .replace(/[^\w\s-]/g, "")
-    .trim()
-    .replace(/\s+/g, "_")
-    .slice(0, 80) || "video";
-}
-
-// Tries the Android client first — usually bypasses YouTube's web bot-check
-// entirely, no cookies or JS runtime needed. Falls back to cookies + web
-// client (with JS runtime for signature solving) if that fails.
-async function getVideoInfo(url) {
-  try {
-    const { stdout } = await execAsync(
-      `yt-dlp --dump-json --no-playlist --extractor-args "youtube:player_client=android" "${url}"`,
-      { maxBuffer: 1024 * 1024 * 16 }
-    );
-    return JSON.parse(stdout);
-  } catch (e) {
-    console.error("[yt-dlp android client failed]", e.stderr || e.message);
-  }
-
-  if (cookiesAvailable) {
-    try {
-      const { stdout } = await execAsync(
-        `yt-dlp --dump-json --no-playlist --js-runtimes node --remote-components ejs:github ${COOKIES_ARGS_STR} "${url}"`,
-        { maxBuffer: 1024 * 1024 * 16 }
-      );
-      return JSON.parse(stdout);
-    } catch (e) {
-      console.error("[yt-dlp cookies fallback failed]", e.stderr || e.message);
-      throw e;
-    }
-  }
-
-  throw new Error("Could not fetch video info via Android client, and no cookies fallback available.");
-}
+// ── helpers ──────────────────────────────────────────────────────────────
 
 function detectProjection(info) {
   const haystack = [
@@ -107,268 +73,86 @@ function detectProjection(info) {
   return "flat";
 }
 
-// Find any video file containing the videoId
-function findDownloadedFile(videoId) {
-  const files = fs.readdirSync(DOWNLOADS_DIR);
-  // First look for a clean merged mp4 (no .fXXX in name)
-  const merged = files.find(f => f.includes(videoId) && /\.mp4$/i.test(f) && !/\.f\d+\./.test(f));
-  if (merged) return merged;
-  // Then any video file with the videoId
-  const any = files.find(f => f.includes(videoId) && /\.(mp4|mkv|webm)$/i.test(f));
-  if (any) return any;
-  // Fallback: newest video file in last 120 seconds
-  const recent = files
-    .filter(f => /\.(mp4|mkv|webm)$/i.test(f) && !/\.f\d+\./.test(f))
-    .map(f => ({ name: f, mtime: fs.statSync(path.join(DOWNLOADS_DIR, f)).mtimeMs }))
-    .filter(f => Date.now() - f.mtime < 120000)
-    .sort((a, b) => b.mtime - a.mtime)[0];
-  return recent?.name ?? null;
+// Plain metadata lookup (used by /info for the URL preview card)
+async function ytDlpDumpJson(url, extraArgs) {
+  const args = ["--dump-json", "--no-playlist", ...extraArgs, url];
+  const { stdout } = await execFileAsync("yt-dlp", args, { maxBuffer: 1024 * 1024 * 16 });
+  return JSON.parse(stdout);
 }
 
-// Manually merge video+audio using ffmpeg if needed
-async function mergeIfNeeded(videoId, title, onProgress) {
-  const files = fs.readdirSync(DOWNLOADS_DIR);
-
-  // Check if already merged
-  const merged = files.find(f => f.includes(videoId) && /\.mp4$/i.test(f) && !/\.f\d+\./.test(f));
-  if (merged) return merged;
-
-  // Find split video and audio files
-  const videoFile = files.find(f => f.includes(videoId) && /\.f\d+\.mp4$/i.test(f));
-  const audioFile = files.find(f => f.includes(videoId) && /\.f\d+\.m4a$/i.test(f));
-
-  if (!videoFile) return null;
-
-  const outputName = `${title}_${videoId}.mp4`;
-  const outputPath = path.join(DOWNLOADS_DIR, outputName);
-
-  // Find ffmpeg on PATH (works cross-platform: Windows locally, Linux on Render)
-  let ffmpegExe = null;
+async function getVideoInfo(url) {
   try {
-    await execAsync(`ffmpeg -version`, { timeout: 3000 });
-    ffmpegExe = "ffmpeg";
+    return await ytDlpDumpJson(url, ["--extractor-args", "youtube:player_client=android"]);
   } catch (e) {
-    console.error("[ffmpeg not found]", e.message);
+    console.error("[info android client failed]", e.stderr || e.message);
   }
-
-  if (!ffmpegExe) {
-    // ffmpeg not found — just serve the video-only file
-    console.log("[warn] ffmpeg not found, serving video-only file");
-    return videoFile;
-  }
-
-  onProgress?.({ message: "Merging video and audio..." });
-
-  const videoPath = path.join(DOWNLOADS_DIR, videoFile);
-
-  if (audioFile) {
-    const audioPath = path.join(DOWNLOADS_DIR, audioFile);
-    await execAsync(
-      `"${ffmpegExe}" -i "${videoPath}" -i "${audioPath}" -c:v copy -c:a aac -y "${outputPath}"`,
-      { maxBuffer: 1024 * 1024 * 32 }
-    );
-    // Clean up split files
-    try { fs.unlinkSync(videoPath); } catch {}
-    try { fs.unlinkSync(audioPath); } catch {}
-  } else {
-    // No audio file, just rename video
-    fs.renameSync(videoPath, outputPath);
-  }
-
-  if (fs.existsSync(outputPath)) return outputName;
-  return videoFile;
-}
-
-// Runs yt-dlp download with a given extra-args set, returns a Promise
-function runYtDlpDownload(url, outputTemplate, extraArgs, onProgress) {
-  return new Promise((resolve, reject) => {
-    const isWindows = process.platform === "win32";
-    const args = [
-      "-f", "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best",
-      "--no-playlist",
-      "--newline",
-      "--no-part",
-      "--no-mtime",
-      "--merge-output-format", "mp4",
-      ...extraArgs,
-      "-o", outputTemplate,
-      url,
-    ];
-
-    console.log("[yt-dlp] starting download with args:", extraArgs.join(" "));
-
-    const ytdlp = spawn("yt-dlp", args, { shell: isWindows, windowsHide: true });
-
-    ytdlp.stdout.on("data", (data) => {
-      const lines = data.toString().split("\n");
-      for (const line of lines) {
-        if (line.trim()) console.log("[yt-dlp]", line.trim());
-        const match = line.match(/(\d+\.?\d*)%/);
-        if (match) {
-          const pct = Math.min(90, Math.round(parseFloat(match[1])));
-          onProgress?.(pct);
-        }
-      }
-    });
-
-    let stderrBuffer = "";
-    ytdlp.stderr.on("data", (d) => {
-      const text = d.toString().trim();
-      stderrBuffer += text + "\n";
-      console.error("[yt-dlp err]", text);
-    });
-    ytdlp.on("close", (code) => {
-      console.log("[yt-dlp] exit code:", code);
-      code === 0
-        ? resolve()
-        : reject(new Error(`yt-dlp failed (code ${code}): ${stderrBuffer.slice(-300)}`));
-    });
-    ytdlp.on("error", (e) => reject(new Error(`yt-dlp not found: ${e.message}`)));
-  });
-}
-
-// Tries Android client first (usually bypasses bot-check, no cookies/JS-runtime needed),
-// falls back to cookies + web client if that fails and cookies are available
-async function downloadVideo(url, outputTemplate, jobId) {
-  const onProgress = (pct) => {
-    const current = jobs.get(jobId);
-    if (current) jobs.set(jobId, { ...current, progress: pct, message: `Downloading... ${pct}%` });
-  };
-
-  try {
-    await runYtDlpDownload(url, outputTemplate, ["--extractor-args", "youtube:player_client=android"], onProgress);
-    return;
-  } catch (e) {
-    console.error("[download android client failed]", e.message);
-  }
-
   if (cookiesAvailable) {
-    const current = jobs.get(jobId);
-    if (current) jobs.set(jobId, { ...current, message: "Retrying with authenticated session..." });
-    await runYtDlpDownload(url, outputTemplate, ["--js-runtimes", "node", "--remote-components", "ejs:github", ...COOKIES_ARGS], onProgress);
-    return;
+    return await ytDlpDumpJson(url, ["--js-runtimes", "node", "--remote-components", "ejs:github", ...COOKIES_ARGS]);
   }
-
-  throw new Error("Download failed via Android client, and no cookies fallback available.");
+  throw new Error("Could not fetch video info via Android client, and no cookies fallback available.");
 }
 
-// ── jobs ──────────────────────────────────────────────────────────────────────
+// Metadata + a single progressive (video+audio already combined) format,
+// so we get a playable direct URL with no server-side merge step at all.
+async function ytDlpResolveFormat(url, extraArgs) {
+  const args = [
+    "-f", "best[height<=720][ext=mp4][acodec!=none][vcodec!=none]/best[ext=mp4][acodec!=none][vcodec!=none]/best",
+    "--no-playlist",
+    "-j",
+    ...extraArgs,
+    url,
+  ];
+  const { stdout } = await execFileAsync("yt-dlp", args, { maxBuffer: 1024 * 1024 * 16 });
+  const info = JSON.parse(stdout);
+  if (!info.url) throw new Error("Resolved format has no direct playable URL (would need merging).");
+  return info;
+}
 
-const jobs = new Map();
-
-// ── routes ────────────────────────────────────────────────────────────────────
-
-app.post("/download", async (req, res) => {
-  const { url } = req.body;
-  if (!url) return res.status(400).json({ error: "Missing url" });
-
-  const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-  jobs.set(jobId, { status: "pending", progress: 0, message: "Queued..." });
-
-  (async () => {
+// Tries the Android client first — usually bypasses YouTube's bot-check
+// entirely, no cookies/JS runtime needed. Falls back to cookies + web
+// client (with JS-runtime signature solving) if that fails.
+async function resolveStream(url) {
+  try {
+    return await ytDlpResolveFormat(url, ["--extractor-args", "youtube:player_client=android"]);
+  } catch (e) {
+    console.error("[stream android client failed]", e.stderr || e.message);
+  }
+  if (cookiesAvailable) {
     try {
-      jobs.set(jobId, { status: "running", progress: 5, message: "Fetching metadata..." });
-
-      let info;
-      try {
-        info = await getVideoInfo(url);
-      } catch (e) {
-        // Surface the real yt-dlp error instead of a generic message
-        throw new Error(`Could not fetch video info: ${(e.stderr || e.message || "").toString().slice(0, 300)}`);
-      }
-
-      const title = safeName(info.title);
-      const videoId = info.id ?? Date.now().toString();
-      const projection = detectProjection(info);
-
-      // Check cache first
-      const existingFile = findDownloadedFile(videoId);
-      if (existingFile) {
-        jobs.set(jobId, {
-          status: "done", progress: 100,
-          message: "Using cached file.",
-          filename: existingFile,
-          projection, title: info.title,
-          thumbnail: info.thumbnail ?? null,
-          duration: info.duration ?? null,
-        });
-        return;
-      }
-
-      jobs.set(jobId, { status: "running", progress: 10, message: "Starting download..." });
-
-      const outputTemplate = path.join(DOWNLOADS_DIR, `${title}_${videoId}.%(ext)s`);
-
-      await downloadVideo(url, outputTemplate, jobId);
-
-      // Try to find or merge the output file
-      jobs.set(jobId, { status: "running", progress: 92, message: "Finalizing..." });
-
-      let outputName = findDownloadedFile(videoId);
-
-      // If split files exist, merge them
-      if (!outputName || /\.f\d+\./.test(outputName)) {
-        outputName = await mergeIfNeeded(videoId, title, ({ message }) => {
-          const current = jobs.get(jobId);
-          if (current) jobs.set(jobId, { ...current, message });
-        });
-      }
-
-      if (!outputName) {
-        const allFiles = fs.readdirSync(DOWNLOADS_DIR);
-        console.error("[error] downloads folder:", allFiles);
-        throw new Error(`File not found after download. Folder has: ${allFiles.filter(f => f !== ".gitkeep").join(", ") || "(empty)"}`);
-      }
-
-      console.log("[done]", outputName);
-      jobs.set(jobId, {
-        status: "done", progress: 100, message: "Ready!",
-        filename: outputName, projection,
-        title: info.title,
-        thumbnail: info.thumbnail ?? null,
-        duration: info.duration ?? null,
-      });
-
-    } catch (err) {
-      console.error("[job error]", err.message);
-      jobs.set(jobId, { status: "error", progress: 0, message: err.message });
+      return await ytDlpResolveFormat(url, ["--js-runtimes", "node", "--remote-components", "ejs:github", ...COOKIES_ARGS]);
+    } catch (e) {
+      console.error("[stream cookies fallback failed]", e.stderr || e.message);
+      throw e;
     }
-  })();
+  }
+  throw new Error("Could not resolve a direct stream URL via Android client, and no cookies fallback available.");
+}
 
-  return res.json({ jobId });
-});
+// ── routes ───────────────────────────────────────────────────────────────
 
-app.get("/jobs/:id", (req, res) => {
-  const job = jobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: "Job not found" });
-  return res.json(job);
-});
-
-app.get("/video/:name", (req, res) => {
-  const filePath = path.join(DOWNLOADS_DIR, req.params.name);
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
-
-  const stat = fs.statSync(filePath);
-  const fileSize = stat.size;
-  const range = req.headers.range;
-  const ext = path.extname(filePath).toLowerCase();
-  const mimeTypes = { ".mp4": "video/mp4", ".mkv": "video/x-matroska", ".webm": "video/webm", ".m4a": "video/mp4" };
-  const contentType = mimeTypes[ext] || "video/mp4";
-
-  if (range) {
-    const parts = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-    res.writeHead(206, {
-      "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-      "Accept-Ranges": "bytes",
-      "Content-Length": end - start + 1,
-      "Content-Type": contentType,
+// Resolves a direct CDN URL via yt-dlp, then hands back OUR OWN /proxy url
+// (not the raw googlevideo.com link) — the player needs crossOrigin="anonymous"
+// for the WebGL video texture, and YouTube's CDN doesn't send CORS headers,
+// so the raw link would fail to load in the VR sphere even though it plays
+// fine in a plain <video> tag.
+app.get("/stream", async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: "Missing url" });
+  try {
+    const info = await resolveStream(String(url));
+    const projection = detectProjection(info);
+    const streamUrl = `${req.protocol}://${req.get("host")}/proxy?url=${encodeURIComponent(info.url)}`;
+    res.json({
+      streamUrl,
+      title: info.title,
+      thumbnail: info.thumbnail ?? null,
+      duration: info.duration ?? null,
+      uploader: info.uploader ?? null,
+      projection,
     });
-    fs.createReadStream(filePath, { start, end }).pipe(res);
-  } else {
-    res.writeHead(200, { "Content-Length": fileSize, "Content-Type": contentType, "Accept-Ranges": "bytes" });
-    fs.createReadStream(filePath).pipe(res);
+  } catch (err) {
+    console.error("[stream error]", err.stderr || err.message);
+    res.status(500).json({ error: (err.stderr || err.message || "Could not resolve stream").toString().slice(0, 500) });
   }
 });
 
@@ -377,49 +161,62 @@ app.get("/info", async (req, res) => {
   if (!url) return res.status(400).json({ error: "Missing url" });
   try {
     const info = await getVideoInfo(String(url));
-    return res.json({ title: info.title, thumbnail: info.thumbnail, duration: info.duration, uploader: info.uploader, projection: detectProjection(info) });
+    res.json({
+      title: info.title,
+      thumbnail: info.thumbnail,
+      duration: info.duration,
+      uploader: info.uploader,
+      projection: detectProjection(info),
+    });
   } catch (err) {
-    return res.status(500).json({ error: (err.stderr || err.message || "").toString().slice(0, 500) });
+    res.status(500).json({ error: (err.stderr || err.message || "").toString().slice(0, 500) });
+  }
+});
+
+// Streams bytes straight through from the CDN to the browser — no disk
+// write, no full-file buffering in memory. This is what actually fixes the
+// OOM crashes (RAM usage stays flat regardless of video length/resolution),
+// and it adds the CORS header the CDN doesn't provide, which the video
+// texture needs.
+app.get("/proxy", async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: "Missing url" });
+
+  try {
+    const upstreamHeaders = { "user-agent": "Mozilla/5.0" };
+    if (req.headers.range) upstreamHeaders.range = req.headers.range;
+
+    const upstream = await fetch(String(url), { headers: upstreamHeaders });
+
+    res.status(upstream.status);
+    for (const h of ["content-type", "content-length", "content-range", "accept-ranges"]) {
+      const v = upstream.headers.get(h);
+      if (v) res.setHeader(h, v);
+    }
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "no-store");
+
+    if (!upstream.body) return res.end();
+    Readable.fromWeb(upstream.body).pipe(res);
+  } catch (err) {
+    console.error("[proxy error]", err.message);
+    if (!res.headersSent) res.status(502).json({ error: "Upstream fetch failed: " + err.message });
   }
 });
 
 app.get("/debug-cookies", async (req, res) => {
   try {
-    refreshWritableCookies(); // get a fresh writable copy in case the secret changed
-    const { stdout, stderr } = await execAsync(
-      `yt-dlp --js-runtimes node --remote-components ejs:github ${COOKIES_ARGS_STR} --dump-json --no-playlist "https://www.youtube.com/watch?v=VDNIuBQBSmk"`,
-      { maxBuffer: 1024 * 1024 * 16 }
-    );
-    res.json({ success: true, cookiesAvailable, stdout: stdout.slice(0, 500), stderr });
+    refreshWritableCookies();
+    const info = await ytDlpResolveFormat("https://www.youtube.com/watch?v=VDNIuBQBSmk", [
+      "--js-runtimes", "node", "--remote-components", "ejs:github", ...COOKIES_ARGS,
+    ]);
+    res.json({ success: true, cookiesAvailable, title: info.title, hasUrl: !!info.url });
   } catch (e) {
-    res.json({ success: false, cookiesAvailable, error: e.message, stderr: e.stderr, stdout: e.stdout });
+    res.json({ success: false, cookiesAvailable, error: e.stderr || e.message });
   }
-});
-
-app.get("/list", (_req, res) => {
-  try {
-    const files = fs.readdirSync(DOWNLOADS_DIR)
-      .filter(f => /\.(mp4|mkv|webm)$/i.test(f) && !/\.f\d+\./.test(f))
-      .map(name => {
-        const stat = fs.statSync(path.join(DOWNLOADS_DIR, name));
-        return { name, size: stat.size, createdAt: stat.birthtime };
-      })
-      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    res.json(files);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete("/video/:name", (req, res) => {
-  const fp = path.join(DOWNLOADS_DIR, req.params.name);
-  if (!fs.existsSync(fp)) return res.status(404).json({ error: "Not found" });
-  try { fs.unlinkSync(fp); res.json({ success: true }); }
-  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🎬  VR Video Server`);
-  console.log(`   API  → http://localhost:${PORT}`);
-  console.log(`   Files-> ${DOWNLOADS_DIR}\n`);
+  console.log(`\n🎬  VR Video Server (streaming-only, no downloads)`);
+  console.log(`   API → http://localhost:${PORT}\n`);
 });
