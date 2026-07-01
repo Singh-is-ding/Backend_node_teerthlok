@@ -4,8 +4,7 @@ export default function Navbar() {
   const { pathname } = useLocation();
 
   const links = [
-    { to: "/", label: "Download" },
-    { to: "/library", label: "Library" },
+    { to: "/", label: "Watch" },
   ];
 
   return (
