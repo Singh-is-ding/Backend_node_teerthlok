@@ -18,7 +18,7 @@ app.set("trust proxy", true);
 app.use(cors());
 app.use(express.json());
 
-// ── crash / memory visibility (kept lightweight, no more OOM expected) ─────
+// ── crash / memory visibility ───────────────────────────────────────────
 process.on("uncaughtException", (err) => {
   console.error("[FATAL uncaughtException]", err.stack || err.message);
 });
@@ -31,8 +31,6 @@ setInterval(() => {
 }, 30000);
 
 // ── cookies (optional fallback only — most requests won't need it) ─────────
-// Render's Secret Files are mounted read-only, but yt-dlp needs a writable
-// path to (re)save the cookie jar, so we copy it once at startup.
 const RUNTIME_DIR = path.join(__dirname, ".runtime");
 if (!fs.existsSync(RUNTIME_DIR)) fs.mkdirSync(RUNTIME_DIR, { recursive: true });
 
@@ -55,6 +53,21 @@ console.log(cookiesAvailable ? "[cookies] loaded from secret file" : "[cookies] 
 
 const COOKIES_ARGS = cookiesAvailable ? ["--cookies", WRITABLE_COOKIES_PATH] : [];
 
+// ── concurrency lock ─────────────────────────────────────────────────────
+// The cookies + JS-runtime fallback spins up a heavy Node subprocess
+// (yt-dlp's signature/JS challenge solver). Two of these running at once
+// is what was blowing past 512MB and crashing the instance — e.g. the
+// preview /info call and a /stream click landing close together.
+// This queue guarantees at most ONE heavy resolve runs at a time; anything
+// else just waits its turn instead of spawning a second subprocess.
+let resolveQueue = Promise.resolve();
+function runExclusive(fn) {
+  const run = resolveQueue.then(fn, fn); // run fn regardless of prior success/failure
+  // keep the chain alive but don't let a rejection break future queuing
+  resolveQueue = run.catch(() => {});
+  return run;
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────
 
 function detectProjection(info) {
@@ -73,29 +86,29 @@ function detectProjection(info) {
   return "flat";
 }
 
-// Plain metadata lookup (used by /info for the URL preview card)
+// Plain metadata lookup (used by /info for the URL preview card).
+// Android-client-only, no cookies/JS-runtime fallback — kept deliberately
+// cheap since it fires on every keystroke via debounce.
 async function ytDlpDumpJson(url, extraArgs) {
   const args = ["--dump-json", "--no-playlist", ...extraArgs, url];
   const { stdout } = await execFileAsync("yt-dlp", args, { maxBuffer: 1024 * 1024 * 16 });
   return JSON.parse(stdout);
 }
 
-// Intentionally Android-client-only, no cookies/JS-runtime fallback here.
-// This is just the lightweight preview card (fires on every keystroke via
-// debounce) — it must never run the heavy JS-runtime subprocess, or it can
-// end up running concurrently with a real /stream resolve and double the
-// memory usage (which is what was causing the OOM crashes). If Android
-// fails, the preview simply doesn't show — the user can still hit "Watch"
-// and /stream will do the full resolve including the cookies fallback.
 async function getVideoInfo(url) {
   return await ytDlpDumpJson(url, ["--extractor-args", "youtube:player_client=android"]);
 }
 
-// Metadata + a single progressive (video+audio already combined) format,
-// so we get a playable direct URL with no server-side merge step at all.
+// Metadata + a single progressive (video+audio already combined) MP4 format.
+// IMPORTANT: no bare "best" fallback. A bare "best" can resolve to an HLS
+// (.m3u8) manifest instead of a single file — our /proxy route pipes bytes
+// verbatim, so an HLS manifest's individual .ts segment URLs point straight
+// at googlevideo.com and bypass the proxy entirely, causing CORS failures
+// in the player. Keeping this MP4-only means info.url is always a single
+// direct file our proxy can actually cover end-to-end.
 async function ytDlpResolveFormat(url, extraArgs) {
   const args = [
-    "-f", "best[height<=720][ext=mp4][acodec!=none][vcodec!=none]/best[ext=mp4][acodec!=none][vcodec!=none]/best",
+    "-f", "best[height<=720][ext=mp4][acodec!=none][vcodec!=none]/worst[ext=mp4][acodec!=none][vcodec!=none]",
     "--no-playlist",
     "-j",
     ...extraArgs,
@@ -104,36 +117,37 @@ async function ytDlpResolveFormat(url, extraArgs) {
   const { stdout } = await execFileAsync("yt-dlp", args, { maxBuffer: 1024 * 1024 * 16 });
   const info = JSON.parse(stdout);
   if (!info.url) throw new Error("Resolved format has no direct playable URL (would need merging).");
+  if (info.protocol && /m3u8|hls|dash/i.test(info.protocol)) {
+    throw new Error("Only an HLS/DASH stream is available for this video — no single progressive MP4 file exists, so it can't be proxied.");
+  }
   return info;
 }
 
 // Tries the Android client first — usually bypasses YouTube's bot-check
 // entirely, no cookies/JS runtime needed. Falls back to cookies + web
 // client (with JS-runtime signature solving) if that fails.
+// Wrapped in runExclusive so only one heavy resolve ever runs at once.
 async function resolveStream(url) {
-  try {
-    return await ytDlpResolveFormat(url, ["--extractor-args", "youtube:player_client=android"]);
-  } catch (e) {
-    console.error("[stream android client failed]", e.stderr || e.message);
-  }
-  if (cookiesAvailable) {
+  return runExclusive(async () => {
     try {
-      return await ytDlpResolveFormat(url, ["--js-runtimes", "node", "--remote-components", "ejs:github", ...COOKIES_ARGS]);
+      return await ytDlpResolveFormat(url, ["--extractor-args", "youtube:player_client=android"]);
     } catch (e) {
-      console.error("[stream cookies fallback failed]", e.stderr || e.message);
-      throw e;
+      console.error("[stream android client failed]", e.stderr || e.message);
     }
-  }
-  throw new Error("Could not resolve a direct stream URL via Android client, and no cookies fallback available.");
+    if (cookiesAvailable) {
+      try {
+        return await ytDlpResolveFormat(url, ["--js-runtimes", "node", "--remote-components", "ejs:github", ...COOKIES_ARGS]);
+      } catch (e) {
+        console.error("[stream cookies fallback failed]", e.stderr || e.message);
+        throw e;
+      }
+    }
+    throw new Error("Could not resolve a direct stream URL via Android client, and no cookies fallback available.");
+  });
 }
 
 // ── routes ───────────────────────────────────────────────────────────────
 
-// Resolves a direct CDN URL via yt-dlp, then hands back OUR OWN /proxy url
-// (not the raw googlevideo.com link) — the player needs crossOrigin="anonymous"
-// for the WebGL video texture, and YouTube's CDN doesn't send CORS headers,
-// so the raw link would fail to load in the VR sphere even though it plays
-// fine in a plain <video> tag.
 app.get("/stream", async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: "Missing url" });
@@ -173,10 +187,9 @@ app.get("/info", async (req, res) => {
 });
 
 // Streams bytes straight through from the CDN to the browser — no disk
-// write, no full-file buffering in memory. This is what actually fixes the
-// OOM crashes (RAM usage stays flat regardless of video length/resolution),
-// and it adds the CORS header the CDN doesn't provide, which the video
-// texture needs.
+// write, no full-file buffering in memory. RAM stays flat regardless of
+// video length/resolution, and it adds the CORS header the CDN doesn't
+// provide, which the WebGL video texture needs.
 app.get("/proxy", async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: "Missing url" });
@@ -206,9 +219,11 @@ app.get("/proxy", async (req, res) => {
 app.get("/debug-cookies", async (req, res) => {
   try {
     refreshWritableCookies();
-    const info = await ytDlpResolveFormat("https://www.youtube.com/watch?v=VDNIuBQBSmk", [
-      "--js-runtimes", "node", "--remote-components", "ejs:github", ...COOKIES_ARGS,
-    ]);
+    const info = await runExclusive(() =>
+      ytDlpResolveFormat("https://www.youtube.com/watch?v=VDNIuBQBSmk", [
+        "--js-runtimes", "node", "--remote-components", "ejs:github", ...COOKIES_ARGS,
+      ])
+    );
     res.json({ success: true, cookiesAvailable, title: info.title, hasUrl: !!info.url });
   } catch (e) {
     res.json({ success: false, cookiesAvailable, error: e.stderr || e.message });
