@@ -30,7 +30,7 @@ function safeName(str) {
 async function getVideoInfo(url) {
   try {
     const { stdout } = await execAsync(
-      `yt-dlp --dump-json --no-playlist --js-runtimes node "${url}"`,
+      `yt-dlp --dump-json --no-playlist --js-runtimes node --cookies /etc/secrets/cookies.txt "${url}"`,
       { maxBuffer: 1024 * 1024 * 16 }
     );
     return JSON.parse(stdout);
@@ -189,6 +189,7 @@ app.post("/download", async (req, res) => {
           "--no-mtime",
           "--merge-output-format", "mp4",
           "--js-runtimes", "node",
+          "--cookies", "/etc/secrets/cookies.txt",
           "-o", outputTemplate,
           url,
         ];
