@@ -172,7 +172,7 @@ function runYtDlpDownload(url, outputTemplate, extraArgs, onProgress) {
   return new Promise((resolve, reject) => {
     const isWindows = process.platform === "win32";
     const args = [
-      "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+      "-f", "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best",
       "--no-playlist",
       "--newline",
       "--no-part",
