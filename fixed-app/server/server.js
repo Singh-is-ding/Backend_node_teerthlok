@@ -80,16 +80,15 @@ async function ytDlpDumpJson(url, extraArgs) {
   return JSON.parse(stdout);
 }
 
+// Intentionally Android-client-only, no cookies/JS-runtime fallback here.
+// This is just the lightweight preview card (fires on every keystroke via
+// debounce) — it must never run the heavy JS-runtime subprocess, or it can
+// end up running concurrently with a real /stream resolve and double the
+// memory usage (which is what was causing the OOM crashes). If Android
+// fails, the preview simply doesn't show — the user can still hit "Watch"
+// and /stream will do the full resolve including the cookies fallback.
 async function getVideoInfo(url) {
-  try {
-    return await ytDlpDumpJson(url, ["--extractor-args", "youtube:player_client=android"]);
-  } catch (e) {
-    console.error("[info android client failed]", e.stderr || e.message);
-  }
-  if (cookiesAvailable) {
-    return await ytDlpDumpJson(url, ["--js-runtimes", "node", "--remote-components", "ejs:github", ...COOKIES_ARGS]);
-  }
-  throw new Error("Could not fetch video info via Android client, and no cookies fallback available.");
+  return await ytDlpDumpJson(url, ["--extractor-args", "youtube:player_client=android"]);
 }
 
 // Metadata + a single progressive (video+audio already combined) format,
