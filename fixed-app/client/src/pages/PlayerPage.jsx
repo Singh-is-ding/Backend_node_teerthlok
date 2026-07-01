@@ -1,7 +1,6 @@
 import { useLocation, useNavigate, Link } from "react-router-dom";
 import { useState } from "react";
 import VRPlayer from "../components/VRPlayer.jsx";
-import { videoUrl } from "../api.js";
 
 export default function PlayerPage() {
   const { state } = useLocation();
@@ -9,12 +8,12 @@ export default function PlayerPage() {
   const [uploadedUrl, setUploadedUrl] = useState(null);
   const [dragOver, setDragOver] = useState(false);
 
-  // Came from download flow
-  const filename = state?.filename;
+  // Came from the stream flow — a direct playable URL, no server-side file
+  const streamUrl = state?.streamUrl;
   const projection = state?.projection ?? "360";
   const title = state?.title ?? "";
 
-  const url = uploadedUrl || (filename ? videoUrl(filename) : null);
+  const url = uploadedUrl || streamUrl || null;
 
   const handleFile = (file) => {
     if (!file || !file.type.startsWith("video/")) return;
@@ -35,7 +34,7 @@ export default function PlayerPage() {
         <div className="w-full max-w-lg text-center">
           <h2 className="font-display text-4xl tracking-widest mb-2">VR PLAYER</h2>
           <p className="text-sm mb-8" style={{ color: "#4a4a6a" }}>
-            No video selected. Download one from the{" "}
+            No video selected. Paste a URL on the{" "}
             <Link to="/" style={{ color: "#00d4ff" }}>home page</Link> or upload a local file.
           </p>
 
