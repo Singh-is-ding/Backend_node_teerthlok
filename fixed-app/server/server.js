@@ -14,6 +14,28 @@ const DOWNLOADS_DIR = path.join(__dirname, "downloads");
 
 if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
+// Render's Secret Files are mounted read-only, but yt-dlp needs to re-save
+// the cookie jar after use. So copy the secret file into a writable path once at startup.
+const SECRET_COOKIES_PATH = "/etc/secrets/cookies.txt";
+const WRITABLE_COOKIES_PATH = path.join(DOWNLOADS_DIR, "cookies_runtime.txt");
+
+function refreshWritableCookies() {
+  try {
+    if (fs.existsSync(SECRET_COOKIES_PATH)) {
+      fs.copyFileSync(SECRET_COOKIES_PATH, WRITABLE_COOKIES_PATH);
+      return true;
+    }
+  } catch (e) {
+    console.error("[cookies] failed to copy secret cookies file:", e.message);
+  }
+  return false;
+}
+const cookiesAvailable = refreshWritableCookies();
+console.log(cookiesAvailable ? "[cookies] loaded from secret file" : "[cookies] no secret cookies file found, proceeding without cookies");
+
+const COOKIES_ARGS = cookiesAvailable ? ["--cookies", WRITABLE_COOKIES_PATH] : [];
+const COOKIES_ARGS_STR = cookiesAvailable ? `--cookies "${WRITABLE_COOKIES_PATH}"` : "";
+
 app.use(cors());
 app.use(express.json());
 
@@ -30,7 +52,7 @@ function safeName(str) {
 async function getVideoInfo(url) {
   try {
     const { stdout } = await execAsync(
-      `yt-dlp --dump-json --no-playlist --js-runtimes node --cookies /etc/secrets/cookies.txt "${url}"`,
+      `yt-dlp --dump-json --no-playlist --js-runtimes node ${COOKIES_ARGS_STR} "${url}"`,
       { maxBuffer: 1024 * 1024 * 16 }
     );
     return JSON.parse(stdout);
@@ -189,7 +211,7 @@ app.post("/download", async (req, res) => {
           "--no-mtime",
           "--merge-output-format", "mp4",
           "--js-runtimes", "node",
-          "--cookies", "/etc/secrets/cookies.txt",
+          ...COOKIES_ARGS,
           "-o", outputTemplate,
           url,
         ];
@@ -310,13 +332,14 @@ app.get("/info", async (req, res) => {
 
 app.get("/debug-cookies", async (req, res) => {
   try {
+    refreshWritableCookies(); // get a fresh writable copy in case the secret changed
     const { stdout, stderr } = await execAsync(
-      `yt-dlp --cookies /etc/secrets/cookies.txt --dump-json --no-playlist "https://www.youtube.com/watch?v=VDNIuBQBSmk"`,
+      `yt-dlp --js-runtimes node ${COOKIES_ARGS_STR} --dump-json --no-playlist "https://www.youtube.com/watch?v=VDNIuBQBSmk"`,
       { maxBuffer: 1024 * 1024 * 16 }
     );
-    res.json({ success: true, stdout: stdout.slice(0, 500), stderr });
+    res.json({ success: true, cookiesAvailable, stdout: stdout.slice(0, 500), stderr });
   } catch (e) {
-    res.json({ success: false, error: e.message, stderr: e.stderr, stdout: e.stdout });
+    res.json({ success: false, cookiesAvailable, error: e.message, stderr: e.stderr, stdout: e.stdout });
   }
 });
 
