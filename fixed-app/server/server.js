@@ -49,18 +49,34 @@ function safeName(str) {
     .slice(0, 80) || "video";
 }
 
+// Tries the Android client first — usually bypasses YouTube's web bot-check
+// entirely, no cookies or JS runtime needed. Falls back to cookies + web
+// client (with JS runtime for signature solving) if that fails.
 async function getVideoInfo(url) {
   try {
     const { stdout } = await execAsync(
-      `yt-dlp --dump-json --no-playlist --js-runtimes node ${COOKIES_ARGS_STR} "${url}"`,
+      `yt-dlp --dump-json --no-playlist --extractor-args "youtube:player_client=android" "${url}"`,
       { maxBuffer: 1024 * 1024 * 16 }
     );
     return JSON.parse(stdout);
   } catch (e) {
-    // Log the REAL yt-dlp error (stderr) so it shows up in Render logs
-    console.error("[yt-dlp stderr]", e.stderr || e.message);
-    throw e;
+    console.error("[yt-dlp android client failed]", e.stderr || e.message);
   }
+
+  if (cookiesAvailable) {
+    try {
+      const { stdout } = await execAsync(
+        `yt-dlp --dump-json --no-playlist --js-runtimes node ${COOKIES_ARGS_STR} "${url}"`,
+        { maxBuffer: 1024 * 1024 * 16 }
+      );
+      return JSON.parse(stdout);
+    } catch (e) {
+      console.error("[yt-dlp cookies fallback failed]", e.stderr || e.message);
+      throw e;
+    }
+  }
+
+  throw new Error("Could not fetch video info via Android client, and no cookies fallback available.");
 }
 
 function detectProjection(info) {
@@ -151,6 +167,79 @@ async function mergeIfNeeded(videoId, title, onProgress) {
   return videoFile;
 }
 
+// Runs yt-dlp download with a given extra-args set, returns a Promise
+function runYtDlpDownload(url, outputTemplate, extraArgs, onProgress) {
+  return new Promise((resolve, reject) => {
+    const isWindows = process.platform === "win32";
+    const args = [
+      "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+      "--no-playlist",
+      "--newline",
+      "--no-part",
+      "--no-mtime",
+      "--merge-output-format", "mp4",
+      ...extraArgs,
+      "-o", outputTemplate,
+      url,
+    ];
+
+    console.log("[yt-dlp] starting download with args:", extraArgs.join(" "));
+
+    const ytdlp = spawn("yt-dlp", args, { shell: isWindows, windowsHide: true });
+
+    ytdlp.stdout.on("data", (data) => {
+      const lines = data.toString().split("\n");
+      for (const line of lines) {
+        if (line.trim()) console.log("[yt-dlp]", line.trim());
+        const match = line.match(/(\d+\.?\d*)%/);
+        if (match) {
+          const pct = Math.min(90, Math.round(parseFloat(match[1])));
+          onProgress?.(pct);
+        }
+      }
+    });
+
+    let stderrBuffer = "";
+    ytdlp.stderr.on("data", (d) => {
+      const text = d.toString().trim();
+      stderrBuffer += text + "\n";
+      console.error("[yt-dlp err]", text);
+    });
+    ytdlp.on("close", (code) => {
+      console.log("[yt-dlp] exit code:", code);
+      code === 0
+        ? resolve()
+        : reject(new Error(`yt-dlp failed (code ${code}): ${stderrBuffer.slice(-300)}`));
+    });
+    ytdlp.on("error", (e) => reject(new Error(`yt-dlp not found: ${e.message}`)));
+  });
+}
+
+// Tries Android client first (usually bypasses bot-check, no cookies/JS-runtime needed),
+// falls back to cookies + web client if that fails and cookies are available
+async function downloadVideo(url, outputTemplate, jobId) {
+  const onProgress = (pct) => {
+    const current = jobs.get(jobId);
+    if (current) jobs.set(jobId, { ...current, progress: pct, message: `Downloading... ${pct}%` });
+  };
+
+  try {
+    await runYtDlpDownload(url, outputTemplate, ["--extractor-args", "youtube:player_client=android"], onProgress);
+    return;
+  } catch (e) {
+    console.error("[download android client failed]", e.message);
+  }
+
+  if (cookiesAvailable) {
+    const current = jobs.get(jobId);
+    if (current) jobs.set(jobId, { ...current, message: "Retrying with authenticated session..." });
+    await runYtDlpDownload(url, outputTemplate, ["--js-runtimes", "node", ...COOKIES_ARGS], onProgress);
+    return;
+  }
+
+  throw new Error("Download failed via Android client, and no cookies fallback available.");
+}
+
 // ── jobs ──────────────────────────────────────────────────────────────────────
 
 const jobs = new Map();
@@ -198,55 +287,7 @@ app.post("/download", async (req, res) => {
 
       const outputTemplate = path.join(DOWNLOADS_DIR, `${title}_${videoId}.%(ext)s`);
 
-      await new Promise((resolve, reject) => {
-        const isWindows = process.platform === "win32";
-
-        // Let yt-dlp find ffmpeg on PATH — do NOT hardcode a Windows path here,
-        // it breaks on Linux (Render) where ffmpeg lives at e.g. /usr/bin/ffmpeg
-        const args = [
-          "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-          "--no-playlist",
-          "--newline",
-          "--no-part",
-          "--no-mtime",
-          "--merge-output-format", "mp4",
-          "--js-runtimes", "node",
-          ...COOKIES_ARGS,
-          "-o", outputTemplate,
-          url,
-        ];
-
-        console.log("[yt-dlp] starting download...");
-
-        const ytdlp = spawn("yt-dlp", args, { shell: isWindows, windowsHide: true });
-
-        ytdlp.stdout.on("data", (data) => {
-          const lines = data.toString().split("\n");
-          for (const line of lines) {
-            if (line.trim()) console.log("[yt-dlp]", line.trim());
-            const match = line.match(/(\d+\.?\d*)%/);
-            if (match) {
-              const pct = Math.min(90, Math.round(parseFloat(match[1])));
-              const current = jobs.get(jobId);
-              if (current) jobs.set(jobId, { ...current, progress: pct, message: `Downloading... ${pct}%` });
-            }
-          }
-        });
-
-        let stderrBuffer = "";
-        ytdlp.stderr.on("data", (d) => {
-          const text = d.toString().trim();
-          stderrBuffer += text + "\n";
-          console.error("[yt-dlp err]", text);
-        });
-        ytdlp.on("close", (code) => {
-          console.log("[yt-dlp] exit code:", code);
-          code === 0
-            ? resolve()
-            : reject(new Error(`yt-dlp failed (code ${code}): ${stderrBuffer.slice(-300)}`));
-        });
-        ytdlp.on("error", (e) => reject(new Error(`yt-dlp not found: ${e.message}`)));
-      });
+      await downloadVideo(url, outputTemplate, jobId);
 
       // Try to find or merge the output file
       jobs.set(jobId, { status: "running", progress: 92, message: "Finalizing..." });
