@@ -28,11 +28,17 @@ function safeName(str) {
 }
 
 async function getVideoInfo(url) {
-  const { stdout } = await execAsync(
-    `yt-dlp --dump-json --no-playlist "${url}"`,
-    { maxBuffer: 1024 * 1024 * 16 }
-  );
-  return JSON.parse(stdout);
+  try {
+    const { stdout } = await execAsync(
+      `yt-dlp --dump-json --no-playlist "${url}"`,
+      { maxBuffer: 1024 * 1024 * 16 }
+    );
+    return JSON.parse(stdout);
+  } catch (e) {
+    // Log the REAL yt-dlp error (stderr) so it shows up in Render logs
+    console.error("[yt-dlp stderr]", e.stderr || e.message);
+    throw e;
+  }
 }
 
 function detectProjection(info) {
@@ -86,19 +92,13 @@ async function mergeIfNeeded(videoId, title, onProgress) {
   const outputName = `${title}_${videoId}.mp4`;
   const outputPath = path.join(DOWNLOADS_DIR, outputName);
 
-  // Find ffmpeg
-  const ffmpegPaths = [
-    "C:\\ffmpeg\\ffmpeg.exe",
-    "ffmpeg",
-  ];
-
+  // Find ffmpeg on PATH (works cross-platform: Windows locally, Linux on Render)
   let ffmpegExe = null;
-  for (const p of ffmpegPaths) {
-    try {
-      await execAsync(`"${p}" -version`, { timeout: 3000 });
-      ffmpegExe = p;
-      break;
-    } catch {}
+  try {
+    await execAsync(`ffmpeg -version`, { timeout: 3000 });
+    ffmpegExe = "ffmpeg";
+  } catch (e) {
+    console.error("[ffmpeg not found]", e.message);
   }
 
   if (!ffmpegExe) {
@@ -150,7 +150,8 @@ app.post("/download", async (req, res) => {
       try {
         info = await getVideoInfo(url);
       } catch (e) {
-        throw new Error("Could not fetch video info. Check the URL.");
+        // Surface the real yt-dlp error instead of a generic message
+        throw new Error(`Could not fetch video info: ${(e.stderr || e.message || "").toString().slice(0, 300)}`);
       }
 
       const title = safeName(info.title);
@@ -178,14 +179,14 @@ app.post("/download", async (req, res) => {
       await new Promise((resolve, reject) => {
         const isWindows = process.platform === "win32";
 
-        // Try to use ffmpeg if available, otherwise download best single format
+        // Let yt-dlp find ffmpeg on PATH — do NOT hardcode a Windows path here,
+        // it breaks on Linux (Render) where ffmpeg lives at e.g. /usr/bin/ffmpeg
         const args = [
           "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
           "--no-playlist",
           "--newline",
           "--no-part",
           "--no-mtime",
-          "--ffmpeg-location", "C:\\ffmpeg\\ffmpeg.exe",
           "--merge-output-format", "mp4",
           "-o", outputTemplate,
           url,
@@ -208,10 +209,17 @@ app.post("/download", async (req, res) => {
           }
         });
 
-        ytdlp.stderr.on("data", (d) => console.error("[yt-dlp err]", d.toString().trim()));
+        let stderrBuffer = "";
+        ytdlp.stderr.on("data", (d) => {
+          const text = d.toString().trim();
+          stderrBuffer += text + "\n";
+          console.error("[yt-dlp err]", text);
+        });
         ytdlp.on("close", (code) => {
           console.log("[yt-dlp] exit code:", code);
-          code === 0 ? resolve() : reject(new Error(`yt-dlp failed (code ${code})`));
+          code === 0
+            ? resolve()
+            : reject(new Error(`yt-dlp failed (code ${code}): ${stderrBuffer.slice(-300)}`));
         });
         ytdlp.on("error", (e) => reject(new Error(`yt-dlp not found: ${e.message}`)));
       });
@@ -294,7 +302,7 @@ app.get("/info", async (req, res) => {
     const info = await getVideoInfo(String(url));
     return res.json({ title: info.title, thumbnail: info.thumbnail, duration: info.duration, uploader: info.uploader, projection: detectProjection(info) });
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: (err.stderr || err.message || "").toString().slice(0, 500) });
   }
 });
 
